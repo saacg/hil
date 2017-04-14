@@ -25,7 +25,7 @@ import requests
 import schema
 
 from haas.migrations import paths
-from haas.model import db, Switch
+from haas.model import db, Switch, Port
 
 paths[__name__] = join(dirname(__file__), 'migrations', 'brocade')
 
@@ -60,32 +60,36 @@ class Brocade(Switch):
     def disconnect(self):
         pass
 
-    def apply_networking(self, action):
-        """ Apply a NetworkingAction to the switch.
-
-        Args:
-            action: NetworkingAction to apply to the switch.
-        """
-        interface = action.nic.port.label
-        channel = action.channel
+    def modify_port(self, port, channel, network_id):
+        # XXX: We ought to be able to do a Port.query ... one() here, but
+        # there's somthing I(zenhack)  don't understand going on with when
+        # things are committed in the tests for this driver, and we don't
+        # get any results that way. We should figure out what's going on with
+        # that test and change this.
+        (port,) = filter(lambda p: p.label == port, self.ports)
+        interface = port.label
 
         if channel == 'vlan/native':
-            if action.new_network is None:
+            if network_id is None:
                 self._remove_native_vlan(interface)
             else:
-                self._set_native_vlan(interface,
-                                      action.new_network.network_id)
+                self._set_native_vlan(interface, network_id)
         else:
             match = re.match(re.compile(r'vlan/(\d+)'), channel)
             assert match is not None, "HaaS passed an invalid channel to the" \
                 " switch!"
             vlan_id = match.groups()[0]
 
-            if action.new_network is None:
+            if network_id is None:
                 self._remove_vlan_from_trunk(interface, vlan_id)
             else:
-                assert action.new_network.network_id == vlan_id
+                assert network_id == vlan_id
                 self._add_vlan_to_trunk(interface, vlan_id)
+
+    def revert_port(self, port):
+        self._remove_all_vlans_from_trunk(port)
+        if self._get_native_vlan(port) is not None:
+            self._remove_native_vlan(port)
 
     def get_port_networks(self, ports):
         """Get port configurations of the switch.
@@ -139,7 +143,8 @@ class Brocade(Switch):
         # Enable switching
         url = self._construct_url(interface)
         payload = '<switchport></switchport>'
-        self._make_request('POST', url, data=payload)
+        self._make_request('POST', url, data=payload,
+                           acceptable_error_codes=(409,))
 
         # Set the interface mode
         if mode in ['access', 'trunk']:
@@ -214,6 +219,16 @@ class Brocade(Switch):
         payload = '<vlan><remove>%s</remove></vlan>' % vlan
         self._make_request('PUT', url, data=payload)
 
+    def _remove_all_vlans_from_trunk(self, interface):
+        """ Remove all vlan from a trunk port.
+
+        Args:
+            interface: interface to remove the vlan from
+        """
+        url = self._construct_url(interface, suffix='trunk/allowed/vlan')
+        payload = '<vlan><none>true</none></vlan>'
+        requests.put(url, data=payload, auth=self._auth)
+
     def _set_native_vlan(self, interface, vlan):
         """ Set the native vlan of an interface.
 
@@ -244,7 +259,7 @@ class Brocade(Switch):
 
         """
         url = self._construct_url(interface, suffix='trunk/tag/native-vlan')
-        self._make_request('DELETE', url)
+        self._make_request('DELETE', url, acceptable_error_codes=(404,))
 
     def _construct_url(self, interface, suffix=''):
         """ Construct the API url for a specific interface appending suffix.
@@ -277,8 +292,10 @@ class Brocade(Switch):
         """ Construct the xml tag by prepending the brocade tag prefix. """
         return '{urn:brocade.com:mgmt:brocade-interface}%s' % name
 
-    def _make_request(self, method, url, data=None):
+    def _make_request(self, method, url, data=None,
+                      acceptable_error_codes=()):
         r = requests.request(method, url, data=data, auth=self._auth)
-        if r.status_code >= 400:
+        if r.status_code >= 400 and \
+           r.status_code not in acceptable_error_codes:
             logger.error('Bad Request to switch. Response: %s' % r.text)
         return r
